@@ -1,0 +1,454 @@
+
+<h2 class="sr-only">Hand Tracking 3D Particle System — kendalikan partikel dengan gerakan tangan</h2>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; overflow: hidden; }
+#container { position: relative; width: 100%; height: 600px; background: #000; overflow: hidden; }
+#videoEl { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0.15; transform: scaleX(-1); }
+#canvas3d { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+#ui { position: absolute; top: 12px; left: 12px; right: 12px; display: flex; justify-content: space-between; align-items: flex-start; pointer-events: none; z-index: 10; }
+.badge { background: rgba(255,255,255,0.08); border: 0.5px solid rgba(255,255,255,0.2); color: rgba(255,255,255,0.85); font-size: 12px; padding: 6px 12px; border-radius: 20px; font-family: var(--font-sans, sans-serif); }
+.badge b { color: #a78bfa; }
+#status { position: absolute; bottom: 12px; left: 0; right: 0; text-align: center; font-family: var(--font-sans, sans-serif); font-size: 13px; color: rgba(255,255,255,0.5); pointer-events: none; z-index: 10; }
+#mode-indicator { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-family: var(--font-sans, sans-serif); font-size: 28px; font-weight: 500; color: rgba(167,139,250,0.8); pointer-events: none; z-index: 10; text-shadow: 0 0 30px rgba(167,139,250,0.5); transition: opacity 0.5s; letter-spacing: 2px; }
+#startBtn { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 20; background: rgba(167,139,250,0.15); border: 1px solid rgba(167,139,250,0.5); color: #a78bfa; font-size: 15px; padding: 14px 32px; border-radius: 30px; cursor: pointer; font-family: var(--font-sans, sans-serif); backdrop-filter: blur(10px); transition: all 0.2s; }
+#startBtn:hover { background: rgba(167,139,250,0.25); }
+#gestureHint { position: absolute; bottom: 40px; left: 0; right: 0; display: flex; justify-content: center; gap: 20px; pointer-events: none; z-index: 10; }
+.hint { background: rgba(255,255,255,0.06); border: 0.5px solid rgba(255,255,255,0.15); color: rgba(255,255,255,0.6); font-size: 11px; padding: 5px 12px; border-radius: 12px; font-family: var(--font-sans, sans-serif); }
+</style>
+
+<div id="container">
+  <video id="videoEl" autoplay playsinline muted></video>
+  <canvas id="canvas3d"></canvas>
+  <div id="ui">
+    <div class="badge">✦ <b>INANG</b> Particle System</div>
+    <div class="badge" id="gestureLabel">Gesture: —</div>
+  </div>
+  <div id="mode-indicator" style="opacity:0" id="modeText"></div>
+  <div id="status">Aktifkan kamera untuk mulai</div>
+  <div id="gestureHint" style="display:none">
+    <div class="hint">☝️ Telunjuk → Tulis INANG</div>
+    <div class="hint">✊ Kepalan → Bola 3D</div>
+    <div class="hint">✋ Tangan terbuka → Ledakan</div>
+    <div class="hint">🤏 Cubit → Tarik partikel</div>
+  </div>
+  <button id="startBtn" onclick="startCamera()">✦ Aktifkan Kamera & Hand Tracking</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1640029074/camera_utils.js"></script>
+<script>
+const canvas = document.getElementById('canvas3d');
+const ctx = canvas.getContext('2d');
+const video = document.getElementById('videoEl');
+const gestureLabel = document.getElementById('gestureLabel');
+const statusEl = document.getElementById('status');
+const modeIndicator = document.getElementById('mode-indicator');
+const gestureHint = document.getElementById('gestureHint');
+
+let W, H;
+function resize() {
+  const container = document.getElementById('container');
+  W = canvas.width = container.offsetWidth;
+  H = canvas.height = container.offsetHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// --- Particle System ---
+const COLORS = ['#a78bfa','#818cf8','#c4b5fd','#e0d7ff','#7c3aed','#6366f1','#38bdf8','#f0abfc'];
+
+class Particle {
+  constructor(x, y, z, targetX, targetY, targetZ, color) {
+    this.x = x; this.y = y; this.z = z;
+    this.tx = targetX; this.ty = targetY; this.tz = targetZ;
+    this.ox = targetX; this.oy = targetY; this.oz = targetZ;
+    this.color = color || COLORS[Math.floor(Math.random() * COLORS.length)];
+    this.size = Math.random() * 2.5 + 0.8;
+    this.alpha = Math.random() * 0.5 + 0.5;
+    this.vx = (Math.random()-0.5)*3;
+    this.vy = (Math.random()-0.5)*3;
+    this.vz = (Math.random()-0.5)*3;
+    this.trail = [];
+    this.age = 0;
+  }
+  update(speed) {
+    this.trail.push({x: this.x, y: this.y, z: this.z});
+    if (this.trail.length > 5) this.trail.shift();
+    const ease = speed || 0.06;
+    this.x += (this.tx - this.x) * ease + this.vx * 0.1;
+    this.y += (this.ty - this.y) * ease + this.vy * 0.1;
+    this.z += (this.tz - this.z) * ease + this.vz * 0.1;
+    this.vx *= 0.92; this.vy *= 0.92; this.vz *= 0.92;
+    this.age++;
+  }
+  project(cx, cy, fov) {
+    const scale = fov / (fov + this.z);
+    const sx = this.x * scale + cx;
+    const sy = this.y * scale + cy;
+    return { sx, sy, scale };
+  }
+}
+
+let particles = [];
+let rotX = 0, rotY = 0, rotZ = 0;
+let autoRotY = 0;
+let currentMode = 'idle';
+let handCenter = { x: 0.5, y: 0.5 };
+let handVel = { x: 0, y: 0 };
+let prevHandCenter = { x: 0.5, y: 0.5 };
+let currentGesture = 'none';
+let modeChangeTimer = 0;
+let initDone = false;
+let handPresent = false;
+let handAbsentFrames = 0;
+let pinchDist = 0;
+let prevPinchDist = 0;
+let scaleOffset = 1;
+
+function scatterParticles() {
+  const spreadRadius = 220;
+  particles.forEach(p => {
+    const angle = Math.random() * Math.PI * 2;
+    const radius = spreadRadius + Math.random() * 180;
+    p.tx = Math.cos(angle) * radius;
+    p.ty = (Math.random() - 0.5) * 240;
+    p.tz = Math.sin(angle) * radius;
+    p.vx += (Math.random() - 0.5) * 4;
+    p.vy += (Math.random() - 0.5) * 4;
+    p.vz += (Math.random() - 0.5) * 4;
+  });
+}
+
+// --- Letter Shapes for "INANG" ---
+function getLetterPoints(letter, offsetX, offsetY, scale, density) {
+  const pts = [];
+  const s = scale || 1;
+  const d = density || 18;
+
+  const letters = {
+    'I': [[0,0],[0,1],[0,2],[0,3],[0,4],[-0.3,0],[0.3,0],[-0.3,4],[0.3,4]],
+    'N': [[0,0],[0,1],[0,2],[0,3],[0,4],[0.8,4],[0.8,3],[0.8,2],[0.8,1],[0.8,0],[0.2,1],[0.4,2],[0.6,3]],
+    'A': [[-0.4,4],[0,0],[0.4,4],[-0.25,2.5],[0.25,2.5],[0,0.5]],
+    'G': [[0.4,0],[0.1,0],[-0.2,0.1],[-0.4,0.5],[-0.4,1],[-0.4,2],[-0.4,3],[-0.4,3.5],[-0.2,4],[0.1,4],[0.4,4],[0.4,3],[0.4,2],[0.15,2]],
+  };
+
+  const raw = letters[letter] || [];
+  for (let i = 0; i < raw.length - 1; i++) {
+    const [x1,y1] = raw[i];
+    const [x2,y2] = raw[i+1];
+    for (let t = 0; t < d; t++) {
+      const f = t / d;
+      pts.push({
+        x: (x1 + (x2-x1)*f) * s * 28 + offsetX,
+        y: (y1 + (y2-y1)*f) * s * 28 + offsetY,
+        z: (Math.random()-0.5) * s * 8
+      });
+    }
+  }
+  return pts;
+}
+
+function getINANGPoints(cx, cy, scale) {
+  const letters = ['I','N','A','N','G'];
+  const spacing = 48 * (scale || 1);
+  const totalW = spacing * (letters.length - 1);
+  let pts = [];
+  letters.forEach((l, i) => {
+    const ox = cx - totalW/2 + i * spacing;
+    const oy = cy - 60 * (scale||1);
+    pts = pts.concat(getLetterPoints(l, ox, oy, scale||1));
+  });
+  return pts;
+}
+
+function createSpherePoints(cx, cy, r, count) {
+  const pts = [];
+  for (let i = 0; i < count; i++) {
+    const phi = Math.acos(1 - 2*(i+0.5)/count);
+    const theta = Math.PI * (1 + Math.sqrt(5)) * i;
+    pts.push({
+      x: cx + r * Math.sin(phi)*Math.cos(theta),
+      y: cy + r * Math.sin(phi)*Math.sin(theta),
+      z: r * Math.cos(phi)
+    });
+  }
+  return pts;
+}
+
+function createExplodeTargets(cx, cy, count) {
+  const pts = [];
+  for (let i = 0; i < count; i++) {
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.random() * Math.PI;
+    const r = 150 + Math.random() * 200;
+    pts.push({
+      x: cx + r * Math.sin(phi)*Math.cos(theta),
+      y: cy + r * Math.sin(phi)*Math.sin(theta),
+      z: r * Math.cos(phi)
+    });
+  }
+  return pts;
+}
+
+function initParticles(mode, cx, cy) {
+  const count = mode === 'text' ? 600 : mode === 'sphere' ? 500 : 400;
+  let targets;
+  if (mode === 'text') targets = getINANGPoints(cx||0, cy||0, 1.2);
+  else if (mode === 'sphere') targets = createSpherePoints(cx||0, cy||0, 110, count);
+  else targets = createExplodeTargets(cx||0, cy||0, count);
+
+  if (particles.length === 0) {
+    particles = Array.from({length: count}, (_, i) => {
+      const t = targets[i % targets.length];
+      const startX = (Math.random()-0.5)*400;
+      const startY = (Math.random()-0.5)*400;
+      const startZ = (Math.random()-0.5)*200;
+      return new Particle(startX, startY, startZ, t.x, t.y, t.z, COLORS[i % COLORS.length]);
+    });
+  } else {
+    const n = Math.max(particles.length, count);
+    for (let i = 0; i < n; i++) {
+      if (i < particles.length) {
+        const t = targets[i % targets.length];
+        particles[i].tx = t.x; particles[i].ty = t.y; particles[i].tz = t.z;
+        particles[i].ox = t.x; particles[i].oy = t.y; particles[i].oz = t.z;
+        particles[i].vx += (Math.random()-0.5)*5;
+        particles[i].vy += (Math.random()-0.5)*5;
+      } else {
+        const t = targets[i % targets.length];
+        const p = new Particle((Math.random()-0.5)*300, (Math.random()-0.5)*300, (Math.random()-0.5)*150, t.x, t.y, t.z, COLORS[i % COLORS.length]);
+        particles.push(p);
+      }
+    }
+    particles.length = n;
+  }
+}
+
+// --- 3D Rotation ---
+function rotate3D(x, y, z, rx, ry, rz) {
+  let nx, ny, nz;
+  // Y
+  nx = x * Math.cos(ry) + z * Math.sin(ry);
+  nz = -x * Math.sin(ry) + z * Math.cos(ry);
+  x = nx; z = nz;
+  // X
+  ny = y * Math.cos(rx) - z * Math.sin(rx);
+  nz = y * Math.sin(rx) + z * Math.cos(rx);
+  y = ny; z = nz;
+  // Z
+  nx = x * Math.cos(rz) - y * Math.sin(rz);
+  ny = x * Math.sin(rz) + y * Math.cos(rz);
+  return { x: nx, y: ny, z };
+}
+
+// --- Render ---
+function render() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(0,0,0,0.92)';
+  ctx.fillRect(0, 0, W, H);
+
+  const cx = W / 2;
+  const cy = H / 2;
+  const fov = 600;
+
+  autoRotY += 0.004;
+  if (handPresent) {
+    const dx = handCenter.x - prevHandCenter.x;
+    const dy = handCenter.y - prevHandCenter.y;
+    handVel.x = handVel.x * 0.7 + dx * 0.3;
+    handVel.y = handVel.y * 0.7 + dy * 0.3;
+    prevHandCenter = { ...handCenter };
+    rotY += handVel.x * 4;
+    rotX += handVel.y * 4;
+  } else {
+    rotY = rotY * 0.98 + autoRotY * 0.02;
+    rotX *= 0.97;
+    rotY += 0.008;
+  }
+
+  const sorted = [...particles].sort((a, b) => {
+    const ra = rotate3D(a.x, a.y, a.z, rotX, rotY, rotZ);
+    const rb = rotate3D(b.x, b.y, b.z, rotX, rotY, rotZ);
+    return rb.z - ra.z;
+  });
+
+  for (const p of sorted) {
+    p.update(0.055);
+    const r = rotate3D(p.x, p.y, p.z, rotX, rotY, rotZ);
+    const proj = { sx: r.x + cx, sy: r.y + cy, scale: fov / (fov + r.z * 0.5) };
+    const size = p.size * proj.scale * scaleOffset;
+    if (size < 0.1) continue;
+
+    // Trail
+    if (p.trail.length > 1) {
+      ctx.beginPath();
+      const rt0 = rotate3D(p.trail[0].x, p.trail[0].y, p.trail[0].z, rotX, rotY, rotZ);
+      ctx.moveTo(rt0.x + cx, rt0.y + cy);
+      for (let t = 1; t < p.trail.length; t++) {
+        const rt = rotate3D(p.trail[t].x, p.trail[t].y, p.trail[t].z, rotX, rotY, rotZ);
+        ctx.lineTo(rt.x + cx, rt.y + cy);
+      }
+      ctx.strokeStyle = p.color + '22';
+      ctx.lineWidth = size * 0.4;
+      ctx.stroke();
+    }
+
+    const grd = ctx.createRadialGradient(proj.sx, proj.sy, 0, proj.sx, proj.sy, size * 2);
+    grd.addColorStop(0, p.color + 'ff');
+    grd.addColorStop(0.5, p.color + '88');
+    grd.addColorStop(1, p.color + '00');
+    ctx.beginPath();
+    ctx.arc(proj.sx, proj.sy, size * 2, 0, Math.PI * 2);
+    ctx.fillStyle = grd;
+    ctx.fill();
+  }
+
+  // Draw hand landmark dot
+  if (handPresent) {
+    const hx = (1 - handCenter.x) * W;
+    const hy = handCenter.y * H;
+    const grd2 = ctx.createRadialGradient(hx, hy, 0, hx, hy, 22);
+    grd2.addColorStop(0, 'rgba(167,139,250,0.8)');
+    grd2.addColorStop(1, 'rgba(167,139,250,0)');
+    ctx.beginPath();
+    ctx.arc(hx, hy, 22, 0, Math.PI * 2);
+    ctx.fillStyle = grd2;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(hx, hy, 5, 0, Math.PI * 2);
+    ctx.fillStyle = '#a78bfa';
+    ctx.fill();
+  }
+
+  requestAnimationFrame(render);
+}
+
+// --- Gesture Detection ---
+function detectGesture(landmarks) {
+  const lm = landmarks;
+  if (!lm || lm.length < 21) return 'none';
+
+  const finger_tips = [8, 12, 16, 20];
+  const finger_pips = [6, 10, 14, 18];
+  let extendedCount = 0;
+  for (let i = 0; i < 4; i++) {
+    if (lm[finger_tips[i]].y < lm[finger_pips[i]].y) extendedCount++;
+  }
+  const thumbExtended = lm[4].x < lm[3].x;
+  const indexExtended = lm[8].y < lm[6].y;
+
+  const dx = lm[4].x - lm[8].x;
+  const dy = lm[4].y - lm[8].y;
+  pinchDist = Math.sqrt(dx*dx + dy*dy);
+
+  if (extendedCount === 0 && !thumbExtended) return 'fist';
+  if (extendedCount >= 3) return 'open';
+  if (extendedCount === 1 && indexExtended && pinchDist > 0.07) return 'point';
+  if (pinchDist < 0.05) return 'pinch';
+  return 'other';
+}
+
+// --- MediaPipe Hands ---
+let mpHands = null;
+
+function startCamera() {
+  document.getElementById('startBtn').remove();
+  statusEl.textContent = 'Memuat MediaPipe Hands...';
+  gestureHint.style.display = 'flex';
+
+  mpHands = new Hands({locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/${f}`});
+  mpHands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.6
+  });
+
+  mpHands.onResults((results) => {
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+      handPresent = true;
+      handAbsentFrames = 0;
+      const lm = results.multiHandLandmarks[0];
+      const wrist = lm[0];
+      const mid = lm[9];
+      handCenter = { x: (wrist.x + mid.x) / 2, y: (wrist.y + mid.y) / 2 };
+
+      const gesture = detectGesture(lm);
+      currentGesture = gesture;
+
+      const hx = (1 - handCenter.x) * W - W/2;
+      const hy = (handCenter.y * H) - H/2;
+
+      if (gesture !== currentGesture || modeChangeTimer > 60) {
+        modeChangeTimer = 0;
+      }
+      modeChangeTimer++;
+
+      if (gesture === 'point' && currentMode !== 'text') {
+        currentMode = 'text';
+        initParticles('text', hx * 0.6, hy * 0.6);
+        gestureLabel.innerHTML = 'Gesture: <b>☝️ INANG</b>';
+        showMode('✦ INANG ✦');
+      } else if (gesture === 'fist' && currentMode !== 'sphere') {
+        currentMode = 'sphere';
+        initParticles('sphere', hx * 0.3, hy * 0.3);
+        gestureLabel.innerHTML = 'Gesture: <b>✊ BOLA 3D</b>';
+        showMode('● SPHERE');
+      } else if (gesture === 'open' && currentMode !== 'explode') {
+        currentMode = 'explode';
+        initParticles('explode', hx * 0.3, hy * 0.3);
+        gestureLabel.innerHTML = 'Gesture: <b>✋ LEDAKAN</b>';
+        showMode('✦ BURST');
+      } else if (gesture === 'pinch') {
+        const pinchDelta = pinchDist - prevPinchDist;
+        scaleOffset = Math.max(0.3, Math.min(2.5, scaleOffset + pinchDelta * 5));
+        gestureLabel.innerHTML = 'Gesture: <b>🤏 PINCH</b>';
+      }
+      prevPinchDist = pinchDist;
+      statusEl.textContent = '● Hand detected — gerakkan tangan untuk memutar partikel';
+    } else {
+      handPresent = false;
+      handAbsentFrames++;
+      if (handAbsentFrames === 1) scatterParticles();
+      currentGesture = 'none';
+      gestureLabel.textContent = 'Gesture: —';
+      statusEl.textContent = '○ Tidak ada tangan — tampilkan tangan di depan kamera';
+    }
+  });
+
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 640, height: 480 } })
+    .then(stream => {
+      video.srcObject = stream;
+      video.onloadedmetadata = () => {
+        const camera = new Camera(video, {
+          onFrame: async () => { await mpHands.send({ image: video }); },
+          width: 640, height: 480
+        });
+        camera.start();
+        statusEl.textContent = '● Kamera aktif — tunjukkan tangan Anda';
+        if (!initDone) {
+          initDone = true;
+          initParticles('text', 0, 0);
+          currentMode = 'text';
+        }
+      };
+    })
+    .catch(err => {
+      statusEl.textContent = '✗ Tidak bisa akses kamera: ' + err.message;
+      if (!initDone) { initDone = true; initParticles('text', 0, 0); currentMode = 'text'; }
+    });
+}
+
+function showMode(text) {
+  modeIndicator.textContent = text;
+  modeIndicator.style.opacity = '1';
+  clearTimeout(modeIndicator._timer);
+  modeIndicator._timer = setTimeout(() => { modeIndicator.style.opacity = '0'; }, 2000);
+}
+
+// Auto-init particles without camera
+initParticles('text', 0, 0);
+currentMode = 'text';
+render();
+</script>
